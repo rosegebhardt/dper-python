@@ -1,0 +1,39 @@
+{
+    "geometry_comment": "Fish body and bound vortex sheet geometry",
+    "N": 7,
+    "fish_length": 1.0,
+    "bvs_N": 21,
+    "delta_0": 0.2,
+
+    "initial_state_comment": "Values needed to compute initial position and velocity",
+    "head_position_x": 0,
+    "head_position_y": 1,
+    "head_velocity_x": -0.5,
+    "head_velocity_y": 0,
+    "initial_heading": 180,
+
+    "control_comment": "Heading control parameters",
+    "desired_heading": 90,
+    "max_offset_rate": 0.01,
+
+    "wave_propagation_comment": "Wave propagation and quadratic amplitude parameters",
+    "normalized_wave_number": -6,
+    "wave_frequency": 6.283185307179586,
+    "wave_amplitude": 0.4,
+    "wave_phase": 0,
+    "wave_offset": 0,
+    "c1": 1,
+    "c2": 0.2,
+
+    "material_comment": "Material properties of fish",
+    "E": 10000,
+    "rho": 2000,
+    "d_b": 0.5,
+    "d_s": 0.5,
+
+    "fluids_comment": "Fluid properties",
+    "fluid_density": 1000,
+    "CF": 0.00001,
+    "CD": 1.75,
+    "CA": 1.5
+}

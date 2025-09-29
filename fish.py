@@ -1,223 +1,302 @@
 import numpy as np
-from numpy.linalg import pinv
-from scipy.integrate import solve_ivp
-# type: ignore[import]
+from numpy.linalg import pinv # type: ignore[import]
 from matplotlib.path import Path  # type: ignore[import]
+import json
 
 class Fish:
 
-    def __init__(self, z0):
+    def __init__(self, config_file):
+
+        # Load configuration from JSON file
+        with open(config_file, 'r') as f:
+            config = json.load(f)
 
         # Fish geometry parameters
-        self.N = 7
-        self.fishLength = 0.4
-        delta0 = 0.2
-        r0 = self.fishLength*(1 - delta0)/4
+        self.N = config['N']
+        self.fish_length = config['fish_length']
+        self.bvs_N = config['bvs_N']
+        delta_0 = config['delta_0']
+        r0 = self.fish_length * (1 - delta_0) / 4
 
-        # Wave propogation parameters
-        self.waveNum = -6/self.fishLength
-        self.waveFreq = 3
-        self.waveAmp = 0.4
-        self.c1 = 1; self.c2 = 0.2
+        # Time parameters
+        self.time_N = 0
+        self.delta_T = 0
+        self.time_step = 0
+        self.period_steps = 10
 
-        # Integration settings
-        self.timeStep = 0
-        self.timeN = 51 #501
-        self.tMax = 2 #20
-        self.deltaT = self.tMax/(self.timeN-1)
-        self.initState = z0
+        # Control parameters 
+        self.heading = np.deg2rad(config['initial_heading'])
+        self.desired_heading = np.deg2rad(config['desired_heading'])
+        self.max_offset_rate = config['max_offset_rate']
+        self.past_offset = 0
 
-        # Store outputs
-        self.output = np.zeros((self.timeN,4*self.N))
-        self.output[0, :] = self.initState
-
-        # Control parameters
-        self.periodSteps = round(2*np.pi/self.waveFreq/self.deltaT)
-        self.pastOffset = 0
-        self.maxOffsetRate = 0.05
-        self.desiredHeading = np.radians(180)  
-        self.heading = np.zeros((self.timeN,1))  
+        # Wave propagation parameters
+        self.wave_number = config['normalized_wave_number'] / self.fish_length
+        self.wave_frequency = config['wave_frequency']
+        self.wave_amplitude = config['wave_amplitude']
+        self.wave_phase = config['wave_phase']
+        self.wave_offset = config['wave_offset']
+        self.c1 = config['c1']
+        self.c2 = config['c2']
 
         # Material parameters 
-        self.E = 1.875e4
-        rho = 2000
+        self.E = config['E']
+        rho = config['rho']
+        self.d_b = config['d_b']
+        self.d_s = config['d_s']
 
         # Fluid parameters
-        self.d_b = 0.5
-        self.d_s = 0.5
-        self.rhoFluid = 1000
-        self.CF = 1e-5 # tangent
-        self.CD = 1.75 # normal
-        self.CA = 10
+        self.fluid_density = config['fluid_density']
+        self.external_velocity = np.zeros((2, self.N))
+        self.CF = config['CF'] # tangent drag coefficient
+        self.CD = config['CD'] # normal drag coefficient
+        self.CA = config['CA'] # added mass coefficient
+
+        # Edge properties
+        self.e = np.zeros((2,self.N-1))
+        self.t = np.zeros((2,self.N-1))
+        self.n = np.zeros((2,self.N-1))
+        self.l_edge = np.zeros(self.N-1)
 
         # Form fish polygon
-        angle = np.linspace(0,2*np.pi,1000)
-        circle = r0*(np.exp(1j*angle) + delta0)
-        k = r0*(delta0 + 1)
-        fish = circle + k**2/circle
+        angle = np.linspace(0, 2*np.pi, 1000)
+        circle = r0*(np.exp(1j*angle) + delta_0)
+        k = r0*(delta_0 + 1)
+        fish_boundary = circle + k**2/circle
 
         # Get discretized center line of foil
-        foilPlus = 2*r0*(delta0 + 1)
-        foilMinus = 2*r0*(delta0**2 + 1)/(delta0 - 1)
-        self.centerline = np.linspace(foilMinus, foilPlus, self.N).reshape(-1, 1)
+        foil_plus = 2*r0*(delta_0 + 1)
+        foil_minus = 2*r0*(delta_0**2 + 1)/(delta_0 - 1)
+        self.centerline = np.linspace(foil_minus, foil_plus, self.N)
 
         # Get outer edge of foil along discretized centerline
-        radii = np.zeros((self.N, 1))
-        fish_path = Path(np.column_stack((fish.real, fish.imag)))
-        search_y = np.linspace(0, foilPlus-foilMinus, 200)
-        for i in range(1, self.N-1): 
-            x = self.centerline[i, 0]
+        radii = np.zeros((self.N))
+        fish_path = Path(np.column_stack((fish_boundary.real, fish_boundary.imag)))
+        search_y = np.linspace(0, foil_plus-foil_minus, 200)
+        for ii in range(1, self.N-1): 
+            x = self.centerline[ii]
             for y in search_y:
                 point = (x, y)
                 if not fish_path.contains_point(point):
                     break
-            radii[i] = y
-
+            radii[ii] = y
+        
         # Edge parameters
-        self.lEdgeRef = (self.centerline[1] - self.centerline[0]) * np.ones((self.N-1, 1))
-        self.hEdgeRef = radii[1:] + radii[:-1]
-        self.wEdgeRef = (self.fishLength/4) * np.ones((self.N-1, 1))
+        self.l_edge_ref = (self.centerline[1] - self.centerline[0]) * np.ones((self.N-1))
+        self.h_edge_ref = radii[1:] + radii[:-1]
+        self.w_edge_ref = (self.fish_length/4) * np.ones((self.N-1))
 
         # Derived edge parameters
-        self.AEdgeRef = self.hEdgeRef * self.wEdgeRef
-        MEdgeRef = rho * self.AEdgeRef * self.lEdgeRef
-        IEdgeRef = MEdgeRef * (self.wEdgeRef ** 2) / 12
+        self.a_edge_ref = self.h_edge_ref * self.w_edge_ref
+        self.m_edge_ref = rho * self.a_edge_ref * self.l_edge_ref
+        I_edge_ref = self.m_edge_ref * (self.w_edge_ref ** 2) / 12
 
         # Voronoi node parameters
-        self.lNodeRef = np.vstack([self.lEdgeRef[0], self.lEdgeRef[:-1] + self.lEdgeRef[1:], self.lEdgeRef[-1]]) / 2
-        self.MNodeRef = np.vstack([MEdgeRef[0], MEdgeRef[:-1] + MEdgeRef[1:], MEdgeRef[-1]]) / 2
-        self.INodeRef = np.vstack([IEdgeRef[0], IEdgeRef[:-1] + IEdgeRef[1:], IEdgeRef[-1]]) / 2
+        self.l_node_ref = (np.concatenate([self.l_edge_ref,[0]]) + np.concatenate([[0], self.l_edge_ref])) / 2
+        self.m_node_ref = (np.concatenate([self.m_edge_ref,[0]]) + np.concatenate([[0], self.m_edge_ref])) / 2
+        self.I_node_ref = (np.concatenate([I_edge_ref,[0]]) + np.concatenate([[0], I_edge_ref])) / 2
 
-    def fluidFlow(self, time, x, t, n):
-
-        ############ UNIFORM FLOW ############
-    
-        u_inf = 0.0
-        aoa = np.deg2rad(90)
-        def v_x(x_val,y_val): return u_inf*np.cos(aoa)*np.ones_like(x_val)
-        def v_y(x_val,y_val): return u_inf*np.sin(aoa)*np.ones_like(y_val)
-
-        ############ FREE VORTEX ############
+        # Scale the maximum curvature to imitate carngiform swimming
+        self.recenterline = self.centerline[1:self.N-1] - self.centerline[0]
+        self.centerline_scaling = self.c1 * (self.recenterline / self.fish_length) + self.c2 * (self.recenterline / self.fish_length) ** 2
         
-        # Gamma = 0.1
-        # z_vortex = -self.fishLength
-        # def vel(x_val,y_val): return 1j * Gamma / (2*np.pi*np.conj((x_val + 1j*y_val) - z_vortex))
-        # def v_x(x_val,y_val): return np.real(vel(x_val,y_val))
-        # def v_y(x_val,y_val): return np.imag(vel(x_val,y_val))
-        
-        ############ LINE INTEGRAL ############
-        
-        # Caluclate rectangular segment locations
-        midpoints = (x[:,0:self.N-1] + x[:,1:self.N])/2
-        southwestPoints = midpoints - 0.5*t*self.lEdgeRef.T - 0.5*n*self.hEdgeRef.T
-        northwestPoints = midpoints - 0.5*t*self.lEdgeRef.T + 0.5*n*self.hEdgeRef.T
-        northeastPoints = midpoints + 0.5*t*self.lEdgeRef.T + 0.5*n*self.hEdgeRef.T
-        southeastPoints = midpoints + 0.5*t*self.lEdgeRef.T - 0.5*n*self.hEdgeRef.T
+        # Initialize fish body configuration
+        self.positions = np.zeros((2,self.N))
+        self.velocities = np.zeros((2,self.N))
+        self.phi = np.zeros(self.N-1)
+        self.kappa = np.zeros(self.N-1)
 
-        # Store external flow averaged around segment
-        v_ext = np.zeros((2,self.N-1))
-        nLeftRight = 20
-        nTopDown = 10
+        # Define head configuration
+        self.positions[:, 0] = np.array([config['head_position_x'], config['head_position_y']])
+        self.velocities[:] = np.array([[config['head_velocity_x']], [config['head_velocity_y']]])
+        self.phi[0] = self.heading - np.pi
 
-        # Iterate over segments
+        # Define rest of fish body configuration
+        self.phi[1:] = self.centerline_scaling * self.wave_amplitude * (np.sin(self.wave_number * self.recenterline + self.wave_phase) + self.wave_offset)
+        current_phi = self.phi[0]
+        for ii in range(self.N - 1):
+            self.positions[:, ii+1] = self.positions[:, ii] + self.l_edge_ref[ii] * np.array([np.cos(current_phi), np.sin(current_phi)])
+            if ii < self.N - 2:
+                current_phi += self.phi[ii+1]
+
+        # Bound vortex sheet (BVS) distribution
+        self.bvs_distribution = np.zeros((self.bvs_N))
+        self.which_index = np.zeros((self.bvs_N))
+        self.link_ratio = np.zeros((self.bvs_N))
+
+        # BVS positions and velocities
+        self.bvs_positions = np.zeros((2,self.bvs_N))
+        self.bvs_velocities = np.zeros((2,self.bvs_N))
+        self.bvs_gamma = np.zeros((self.bvs_N))
+        self.bvs_length = np.zeros((self.bvs_N))
+        self.bvs_mass = np.zeros((self.bvs_N))
+
+        # Solve for all BVS values
+        self.initialize_bvs()
+
+    def initialize_bvs(self):
+
+        # Define Chebyshev points
+        chebyshev_index = np.linspace(self.bvs_N-1, 0, self.bvs_N)
+        chebyshev_distribution = self.fish_length * (1 + np.cos(chebyshev_index * np.pi / (self.bvs_N-1))) / 2
+        self.bvs_distribution = chebyshev_distribution
+
+        # Find where each bound vortex falls relative to evenly spaced joints
+        joint_distribution = np.linspace(0, self.fish_length, self.N)
         for ii in range(self.N-1):
 
-            # Discretize edges
-            leftEdge = np.array([
-                np.linspace(southwestPoints[0,ii], northwestPoints[0,ii], nLeftRight),
-                np.linspace(southwestPoints[1,ii], northwestPoints[1,ii], nLeftRight)
-            ])
-            topEdge = np.array([
-                np.linspace(northwestPoints[0,ii], northeastPoints[0,ii], nTopDown),
-                np.linspace(northwestPoints[1,ii], northeastPoints[1,ii], nTopDown)
-            ])
-            rightEdge = np.array([
-                np.linspace(northeastPoints[0,ii], southeastPoints[0,ii], nLeftRight),
-                np.linspace(northeastPoints[1,ii], southeastPoints[1,ii], nLeftRight)
-            ])
-            bottomEdge = np.array([
-                np.linspace(southeastPoints[0,ii], southwestPoints[0,ii], nTopDown),
-                np.linspace(southeastPoints[1,ii], southwestPoints[1,ii], nTopDown)
-            ])
+            indices = np.where((self.bvs_distribution > joint_distribution[ii]) & 
+                               (self.bvs_distribution <= joint_distribution[ii+1]))
+            self.which_index[indices] = ii
+            self.link_ratio[indices] = ((self.bvs_distribution[indices] - joint_distribution[ii]) / 
+                                        (joint_distribution[ii+1]- joint_distribution[ii]))
             
-            # Average velocity across edges
-            v_ext[0,ii] = np.mean(np.hstack([
-                v_x(leftEdge[0,:], leftEdge[1,:]),
-                v_x(topEdge[0,:], topEdge[1,:]),
-                v_x(rightEdge[0,:], rightEdge[1,:]),
-                v_x(bottomEdge[0,:], bottomEdge[1,:])
-            ]))
+        # Exception for final link
+        self.which_index[-1] = self.N-2
+        self.link_ratio[-1] = 1
 
-            v_ext[1,ii] = np.mean(np.hstack([
-                v_y(leftEdge[0,:], leftEdge[1,:]),
-                v_y(topEdge[0,:], topEdge[1,:]),
-                v_y(rightEdge[0,:], rightEdge[1,:]),
-                v_y(bottomEdge[0,:], bottomEdge[1,:])
-            ]))
+        # Solve for BVS positions and velocities
+        self.interpolate_bvs()
 
-        return v_ext
+        # Compute Voronoi BVS edge lengths
+        for ii in range(self.bvs_N-1):
+            half_edge_length = np.linalg.norm((self.bvs_positions[:,ii+1] - self.bvs_positions[:,ii])/2)
+            self.bvs_length[ii] += half_edge_length
+            self.bvs_length[ii+1] += half_edge_length
 
-    def forcedDPER(self, time, z, u):
+        # Compute BVS masses
+        link_densities = self.m_edge_ref / self.l_edge_ref
+        for ii in range(self.bvs_N):
+
+            # Exception for endpoints
+            if ii == 0: 
+                self.bvs_mass[0] = link_densities[0] * self.bvs_length[0]/2
+                continue
+            if ii == self.bvs_N - 1:
+                self.bvs_mass[-1] = link_densities[-1] * self.bvs_length[-1]/2
+                continue
+            
+            # Compute distance to nodes and midpoints
+            node_idx = int(self.which_index[ii])
+            distance_to_left_node = self.bvs_distribution[ii] - joint_distribution[node_idx]
+            distance_to_right_node = joint_distribution[node_idx+1] - self.bvs_distribution[ii]
+            distance_to_midpoint = self.bvs_length[ii]/2
+
+            # Account for overlap on the left
+            if distance_to_left_node < distance_to_midpoint:
+                self.bvs_mass[ii] += link_densities[node_idx-1] * (distance_to_midpoint - distance_to_left_node)
+                self.bvs_mass[ii] += link_densities[node_idx] * distance_to_left_node
+            else:
+                self.bvs_mass[ii] += link_densities[node_idx] * distance_to_midpoint
+
+            # Account for overlap on the right
+            if distance_to_right_node < distance_to_midpoint:
+                self.bvs_mass[ii] += link_densities[node_idx+1] * (distance_to_midpoint - distance_to_right_node)
+                self.bvs_mass[ii] += link_densities[node_idx] * distance_to_right_node
+            else:
+                self.bvs_mass[ii] += link_densities[node_idx] * distance_to_midpoint
+
+    def interpolate_bvs(self):
+        
+        # Interpolate current position and velocites for BVS
+        for ii in range(self.N-1):
+
+            indices = (self.which_index == ii)
+            self.bvs_positions[:,indices] = (self.positions[:,ii][:,np.newaxis] + self.link_ratio[indices][np.newaxis, :]
+                                           *(self.positions[:,ii+1] - self.positions[:,ii])[:,np.newaxis])
+            self.bvs_velocities[:,indices] = (self.velocities[:,ii][:,np.newaxis] + self.link_ratio[indices][np.newaxis, :]
+                                            *(self.velocities[:,ii+1] - self.velocities[:,ii])[:,np.newaxis])
+    
+    def controller(self):
+
+        # Compute and store new heading
+        offset = 0
+        tip_head = self.positions[:, 0] # tip of head
+        end_head = self.positions[:, 2] # end of the head
+        heading_vec = tip_head - end_head
+        self.heading[self.time_step] = np.mod(np.arctan2(heading_vec[1], heading_vec[0]), 2*np.pi)
+        
+        # Apply control after one full cycle
+        if self.time_step >= self.period_steps - 1:
+            
+            # Compute time-averaged heading
+            average_heading = np.mean(self.heading[(self.time_step - self.period_steps + 1):self.time_step+1])
+            error_heading = average_heading - self.desired_heading
+            
+            # Wave offset steering input
+            offset = 0.2*np.tanh(2*error_heading)
+            
+            # Set limit on rate of change
+            if offset > self.past_offset + self.max_offset_rate * self.delta_T:
+                offset = self.past_offset + self.max_offset_rate * self.delta_T
+            if offset < self.past_offset - self.max_offset_rate * self.delta_T:
+                offset = self.past_offset - self.max_offset_rate * self.delta_T
+        
+        # Update past offset variable
+        self.past_offset = offset
+
+        # Return phase offset control input
+        return offset
+
+    def internal_forces(self, time, z0, u):
 
         ############ REDEFINE FREQUENTLY USED PARAMETERS ############
 
         N = self.N
-        centerline = self.centerline
         d_b = self.d_b
         d_s = self.d_s
 
         ############ COMPUTE CURRENT CONFIGURATION ############
 
-        # Define positions, velocities, and accelerations based on state
-        positions = z[:2*N]
-        x = positions.reshape((2,N), order='F')
-        velocities = z[2*N:4*N]
-        v = velocities.reshape((2,N), order='F')
-        
-        # Preallocate edge properties
-        e = np.zeros((2,N-1))
-        t = np.zeros((2,N-1))
-        n = np.zeros((2,N-1))
-        lEdge = np.zeros(N-1)
+        # Define positions and velocities based on state
+        x = z0[0:2*N].reshape((2,N), order='F')
+        v = z0[2*N:4*N].reshape((2,N), order='F')
+        self.positions = x
+        self.velocities = v
+        self.interpolate_bvs()
 
         # Compute edge properties
         for ii in range(N-1):
-            e[:,ii] = x[:,ii+1] - x[:,ii]
-            lEdge[ii] = np.linalg.norm(e[:,ii])
-            t[:,ii] = e[:,ii] / lEdge[ii]
-            n[:,ii] = np.array([-t[1,ii], t[0,ii]])
+            self.e[:,ii] = x[:,ii+1] - x[:,ii]
+            self.l_edge[ii] = np.linalg.norm(self.e[:,ii])
+            self.t[:,ii] = self.e[:,ii] / self.l_edge[ii]
+            self.n[:,ii] = np.array([-self.t[1,ii], self.t[0,ii]])
 
         # Compute node properties
-        phi = np.zeros(N-1)
-        phi[0] = np.arctan2(t[1,0], t[0,0])
+        self.phi[0] = np.arctan2(self.t[1,0], self.t[0,0])
         for ii in range(1, N-1):
-            cross = t[0,ii-1] * t[1,ii] - t[1,ii-1] * t[0,ii]
-            dot = np.dot(t[:,ii-1], t[:,ii])
-            phi[ii] = np.arctan2(cross, dot)
-        kappa = 2*np.tan(phi[1:]/2)
+            cross = self.t[0,ii-1] * self.t[1,ii] - self.t[1,ii-1] * self.t[0,ii]
+            dot = np.dot(self.t[:,ii-1], self.t[:,ii])
+            self.phi[ii] = np.arctan2(cross, dot)
+        self.kappa = 2*np.tan(self.phi[1:]/2)
+
+        # Redefine updated configurations variables
+        t = self.t
+        n = self.n
+        l_edge = self.l_edge
+        phi = self.phi
+        kappa = self.kappa
 
         # Compute curvature and reference curvature
-        recenterline = centerline[1:N-1] - centerline[0]
-        centerlineScaling = self.c1 * recenterline + self.c2 * recenterline**2
-        angleRef = centerlineScaling * self.waveAmp * np.sin(self.waveNum * centerline[1:N-1] + self.waveFreq * time) + u
-        kappaRef = 2*np.tan(angleRef/2)
+        angle_ref = self.centerline_scaling * self.wave_amplitude * (np.sin(self.wave_number * self.recenterline + self.wave_frequency * time + self.wave_phase) + u)
+        kappa_ref = 2*np.tan(angle_ref/2)
 
         ############ ELASTIC FORCES ############
 
         # Compute stretching forces at each node
-        fStretch = self.E * self.AEdgeRef.flatten() * (lEdge / self.lEdgeRef.flatten() - 1)
-        FS1 = np.vstack([fStretch[:, np.newaxis] * t.T, np.array([[0, 0]])]).T
-        FS2 = np.vstack([np.array([[0, 0]]), -fStretch[:, np.newaxis] * t.T]).T
+        f_stretch = self.E * self.a_edge_ref * (l_edge / self.l_edge_ref - 1)
+        FS1 = np.vstack([f_stretch[:, np.newaxis] * t.T, np.array([[0, 0]])]).T
+        FS2 = np.vstack([np.array([[0, 0]]), -f_stretch[:, np.newaxis] * t.T]).T
         FS = FS1 + FS2
         
         # Compute bending forces at each node
-        bendingPartials = (2*self.E*self.INodeRef[1:-1].flatten()*(kappa - kappaRef.flatten()) / 
-                           (self.lNodeRef[1:-1].flatten() * (1 + np.cos(phi[1:]))))
-        fBending1 = np.concatenate([[0], bendingPartials])
-        fBending2 = np.concatenate([-bendingPartials, [0]])
-        fBending = (fBending1 + fBending2) / lEdge
-        FB1 = np.vstack([fBending[:, np.newaxis] * n.T, np.array([[0, 0]])]).T
-        FB2 = np.vstack([np.array([[0, 0]]), -fBending[:, np.newaxis] * n.T]).T
+        bending_partials = (2 * self.E * self.I_node_ref[1:-1] * (kappa - kappa_ref) / 
+                           (self.l_node_ref[1:-1] * (1 + np.cos(phi[1:]))))
+        f_bending_1 = np.concatenate([[0], bending_partials])
+        f_bending_2 = np.concatenate([-bending_partials, [0]])
+        f_bending = (f_bending_1 + f_bending_2) / l_edge
+        FB1 = np.vstack([f_bending[:, np.newaxis] * n.T, np.array([[0, 0]])]).T
+        FB2 = np.vstack([np.array([[0, 0]]), -f_bending[:, np.newaxis] * n.T]).T
         FB = FB1 + FB2 
 
         # Total elastic (conservative) force
@@ -225,27 +304,26 @@ class Fish:
 
         ############ INTERNAL DISSIPATIVE FORCES ############
 
-        # TODO: should the second term of kappaDotDirection be subtracted?
         # Curvature rate of change
-        kappaDotScale = 2/(1 + np.cos(phi[1:N-1]))
-        kappaDotDirection = ((n[:,0:N-2]/lEdge[0:N-2]) * v[:,0:N-2] +
-                             (n[:,0:N-2]/lEdge[0:N-2] + n[:,1:N-1]/lEdge[1:N-1]) * v[:,1:N-1] +
-                             (n[:,1:N-1]/lEdge[1:N-1]) * v[:,2:N])
-        kappaDot = np.concatenate(([0], kappaDotScale*np.sum(kappaDotDirection, axis=0), [0]))
+        kappa_dot_scale = 2/(1 + np.cos(phi[1:N-1]))
+        kappa_dot_direction = ((n[:,0:N-2] / l_edge[0:N-2]) * v[:,0:N-2] -
+                             (n[:,0:N-2] / l_edge[0:N-2] + n[:,1:N-1] / l_edge[1:N-1]) * v[:,1:N-1] +
+                             (n[:,1:N-1] / l_edge[1:N-1]) * v[:,2:N])
+        kappa_dot = np.concatenate(([0], kappa_dot_scale * np.sum(kappa_dot_direction, axis=0), [0]))
 
         # Bending dissipative term
         FBD = np.zeros((2,N))
-        FBD[:,0] = d_b * (-2*kappaDot[1]/(1 + np.cos(phi[1]))) * n[:,0]/lEdge[0]      
-        FBD[:,1] = (d_b * (2*kappaDot[1]/(1 + np.cos(phi[1]))) * n[:,0]/lEdge[0] +
-                    d_b * (2*kappaDot[1]/(1 + np.cos(phi[1])) - 2*kappaDot[2]/(1 + np.cos(phi[2]))) * n[:,1]/lEdge[1])
+        FBD[:,0] = d_b * (-2*kappa_dot[1]/(1 + np.cos(phi[1]))) * n[:,0]/l_edge[0]      
+        FBD[:,1] = (d_b * (2*kappa_dot[1]/(1 + np.cos(phi[1]))) * n[:,0]/l_edge[0] +
+                    d_b * (2*kappa_dot[1]/(1 + np.cos(phi[1])) - 2*kappa_dot[2]/(1 + np.cos(phi[2]))) * n[:,1]/l_edge[1])
         for jj in range(2,N-2):
             FBD[:,jj] = (
-                d_b * (-2*kappaDot[jj-1]/(1 + np.cos(phi[jj-1])) + 2*kappaDot[jj]/(1 + np.cos(phi[jj]))) * n[:,jj-1]/lEdge[jj-1] +
-                d_b * (2*kappaDot[jj]/(1 + np.cos(phi[jj])) - 2*kappaDot[jj+1]/(1 + np.cos(phi[jj+1]))) * n[:,jj]/lEdge[jj]
+                d_b * (-2*kappa_dot[jj-1]/(1 + np.cos(phi[jj-1])) + 2*kappa_dot[jj]/(1 + np.cos(phi[jj]))) * n[:,jj-1]/l_edge[jj-1] +
+                d_b * (2*kappa_dot[jj]/(1 + np.cos(phi[jj])) - 2*kappa_dot[jj+1]/(1 + np.cos(phi[jj+1]))) * n[:,jj]/l_edge[jj]
             )       
-        FBD[:,N-2] = (d_b * (-2*kappaDot[N-3]/(1 + np.cos(phi[N-3])) + 2*kappaDot[N-2]/(1 + np.cos(phi[N-2]))) * n[:,N-3]/lEdge[N-3] +
-                      d_b * (2*kappaDot[N-2]/(1 + np.cos(phi[N-2]))) * n[:,N-2]/lEdge[N-2])
-        FBD[:,N-1] = d_b * (-2*kappaDot[N-2]/(1 + np.cos(phi[N-2]))) * n[:,N-2]/lEdge[N-2]
+        FBD[:,N-2] = (d_b * (-2*kappa_dot[N-3]/(1 + np.cos(phi[N-3])) + 2*kappa_dot[N-2]/(1 + np.cos(phi[N-2]))) * n[:,N-3]/l_edge[N-3] +
+                      d_b * (2*kappa_dot[N-2]/(1 + np.cos(phi[N-2]))) * n[:,N-2]/l_edge[N-2])
+        FBD[:,N-1] = d_b * (-2*kappa_dot[N-2]/(1 + np.cos(phi[N-2]))) * n[:,N-2]/l_edge[N-2]
 
         # Stretching dissipative term
         FSD = np.zeros((2,N))
@@ -259,117 +337,57 @@ class Fish:
         FID = FBD + FSD
 
         ############ HYDRODYNAMIC DRAG FORCES ############
-        
-        # Compute average external flow on edges
-        vExt = self.fluidFlow(time, x, t, n)
 
         # Drag coefficients
-        CT = self.rhoFluid*np.pi*self.CF*(self.hEdgeRef + self.wEdgeRef)/(4*self.lEdgeRef)
-        CN = self.rhoFluid*self.CD*self.hEdgeRef*self.lEdgeRef
+        CT = self.fluid_density * np.pi * self.CF * (self.h_edge_ref + self.w_edge_ref)/(4 * self.l_edge_ref)
+        CN = self.fluid_density * self.CD * self.h_edge_ref * self.l_edge_ref
 
         # Tangent and normal components of edge velocities
-        vEdge = (v[:,0:N-1] + v[:,1:N]) / 2
-        vEdgeRel = vEdge - vExt
-        vEdgeT = np.sum(vEdgeRel*t, axis=0)
-        vEdgeN = np.sum(vEdgeRel*n, axis=0)
+        v_ext = (self.external_velocity[:,0:N-1] + self.external_velocity[:,1:N])/2
+        v_edge = (v[:,0:N-1] + v[:,1:N]) / 2
+        v_rel = v_edge - v_ext
+        v_edge_T = np.sum(v_rel*t, axis=0)
+        v_edge_N = np.sum(v_rel*n, axis=0)
 
         # Hydrodynamic drag forces
-        FHDEdge = (-CT.flatten() * (vEdgeT + vEdgeT * np.abs(vEdgeT)) * t
-                   -CN.flatten() * (vEdgeN + vEdgeN * np.abs(vEdgeN)) * n)
-        FHD = (np.hstack((FHDEdge, np.zeros((2,1)))) + np.hstack((np.zeros((2,1)), FHDEdge))) / 2
+        FHD_edge = (-CT * (v_edge_T + v_edge_T * np.abs(v_edge_T)) * t
+                    -CN * (v_edge_N + v_edge_N * np.abs(v_edge_N)) * n)
+        FHD = (np.hstack((FHD_edge, np.zeros((2,1)))) + np.hstack((np.zeros((2,1)), FHD_edge))) / 2
 
         ############ ADDED MASS FORCES ############
 
         # Set up set of linear equations
         FOther = (FE + FID + FHD).reshape(-1, order='F')
-        muNormal = self.rhoFluid * np.pi * self.CA * self.lEdgeRef * self.hEdgeRef**2
-        addedMassMatrix = np.zeros((2*N, 2*N))
+        mu_normal = self.fluid_density * np.pi * self.CA * self.l_edge_ref * self.h_edge_ref**2
+        added_mass_matrix = np.zeros((2*N, 2*N))
 
         # Top block row
-        addedMassMatrix[0:2,0:2] = 0.25*muNormal[0]*np.outer(n[:,0],n[:,0]) + self.MNodeRef[0]*np.eye(2)
-        addedMassMatrix[0:2,2:4] = 0.25*muNormal[0]*np.outer(n[:,0],n[:,0])
+        added_mass_matrix[0:2,0:2] = 0.25*mu_normal[0]*np.outer(n[:,0],n[:,0]) + self.m_node_ref[0]*np.eye(2)
+        added_mass_matrix[0:2,2:4] = 0.25*mu_normal[0]*np.outer(n[:,0],n[:,0])
 
         # Middle block rows
         for jj in range(1,N-1):
             
             # Lower diagonal
-            addedMassMatrix[2*jj:2*jj+2, 2*jj-2:2*jj] = 0.25*muNormal[jj-1]*np.outer(n[:,jj-1],n[:,jj-1])
+            added_mass_matrix[2*jj:2*jj+2, 2*jj-2:2*jj] = 0.25*mu_normal[jj-1]*np.outer(n[:,jj-1],n[:,jj-1])
             
             # Diagonal
-            addedMassMatrix[2*jj:2*jj+2, 2*jj:2*jj+2] = (self.MNodeRef[jj]*np.eye(2) + 
-                0.25*muNormal[jj-1]*np.outer(n[:,jj-1],n[:,jj-1]) + 0.25*muNormal[jj]*np.outer(n[:,jj],n[:,jj]))
+            added_mass_matrix[2*jj:2*jj+2, 2*jj:2*jj+2] = (self.m_node_ref[jj]*np.eye(2) + 
+                0.25*mu_normal[jj-1]*np.outer(n[:,jj-1],n[:,jj-1]) + 0.25*mu_normal[jj]*np.outer(n[:,jj],n[:,jj]))
             
             # Upper diagonal
-            addedMassMatrix[2*jj:2*jj+2, 2*jj+2:2*jj+4] = 0.25*muNormal[jj]*np.outer(n[:,jj],n[:,jj])
+            added_mass_matrix[2*jj:2*jj+2, 2*jj+2:2*jj+4] = 0.25*mu_normal[jj]*np.outer(n[:,jj],n[:,jj])
         
         # Bottom block row
-        addedMassMatrix[2*N-2:2*N, 2*N-4:2*N-2] = 0.25*muNormal[N-2]*np.outer(n[:,N-2],n[:,N-2])
-        addedMassMatrix[2*N-2:2*N, 2*N-2:2*N] = 0.25*muNormal[N-2]*np.outer(n[:,N-2],n[:,N-2]) + self.MNodeRef[N-1]*np.eye(2)
+        added_mass_matrix[2*N-2:2*N, 2*N-4:2*N-2] = 0.25*mu_normal[N-2]*np.outer(n[:,N-2],n[:,N-2])
+        added_mass_matrix[2*N-2:2*N, 2*N-2:2*N] = 0.25*mu_normal[N-2]*np.outer(n[:,N-2],n[:,N-2]) + self.m_node_ref[N-1]*np.eye(2)
 
         ############ VELOCITY AND ACCELERATION ############
 
         # Solve linear system for accelerations
-        acceleration = pinv(addedMassMatrix) @ FOther
+        acceleration = pinv(added_mass_matrix) @ FOther
 
         # Output time-derivative of state
-        dzdt = np.concatenate([z[2*N:4*N], acceleration])
+        dzdt = np.concatenate([z0[2*N:4*N], acceleration])
 
         return dzdt
-     
-    def integration_step(self):
-        
-        # Compute and store new heading
-        offset = 0
-        tipPos = self.output[self.timeStep,0:2] # tip of head
-        endPos = self.output[self.timeStep,4:6] # end of the head
-        headingVec = tipPos - endPos
-        self.heading[self.timeStep] = np.mod(np.arctan2(headingVec[1], headingVec[0]), 2*np.pi) # [0,2*pi)
-        
-        # Apply control after one full cycle
-        if self.timeStep >= self.periodSteps - 1:
-            
-            # Compute time-averaged heading
-            averageHeading = np.mean(self.heading[(self.timeStep - self.periodSteps + 1):self.timeStep+1])
-            errorHeading = averageHeading - self.desiredHeading
-            
-            # Wave offset steering input
-            offset = 0.1*np.tanh(2*errorHeading)
-            
-            # Set limit on rate of change
-            if offset > self.pastOffset + self.maxOffsetRate*self.deltaT:
-                offset = self.pastOffset + self.maxOffsetRate*self.deltaT
-            if offset < self.pastOffset - self.maxOffsetRate*self.deltaT:
-                offset = self.pastOffset - self.maxOffsetRate*self.deltaT
-            
-        # Integrate forward one time step
-        def steerDPER(time,z): return self.forcedDPER(time,z,offset)
-        tSpan = [self.deltaT*self.timeStep, self.deltaT*(self.timeStep + 1)]
-        step = solve_ivp(steerDPER, tSpan, self.initState, method='RK45', rtol=1e-6, atol=1e-6)
-        
-        # Update initial conditions
-        self.initState = step.y[:, -1]
-        self.pastOffset = offset
-        self.timeStep += 1
-        if self.timeStep != self.timeN:
-            self.output[self.timeStep, :] = (self.initState).T
-
-    def integration_full(self):
-
-        for _ in range(self.timeN-1):
-            self.integration_step()
-            print(self.timeStep)
-
-
-
-############ DEBUGGING ############
-
-# Define initial conditions
-posStack = np.vstack((np.linspace(0, 0.4, 7), np.zeros((1,7))))
-posLine = posStack.reshape(1,14, order='F')
-z0 = (np.concatenate((posLine, np.zeros((1,14))), axis=1)).flatten()
-
-# Write and print fish
-fish = Fish(z0)
-fish.integration_full()
-print(fish.output)
-# print(fish.output[fish.timeStep,:])
